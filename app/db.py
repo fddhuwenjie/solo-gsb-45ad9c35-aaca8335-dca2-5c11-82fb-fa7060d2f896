@@ -80,6 +80,21 @@
 查询同样是单事务：``GET /scores`` / ``GET /rehearsals`` 在同一显式读
 事务内读取主行与全部明细行，二者共用一个已提交快照，避免与发布/领取
 交错时跨修订拼接（旧修订号配新锚点秒数）。
+
+续练副本（``copy_rehearsal``）也是单事务：``BEGIN IMMEDIATE`` 后在同一
+快照内读出源排练的主行、全部提示、发放/跳过记录与批注，整体写入新排练
+ID 下的对应行——副本沿用同一谱例，继承读取瞬间的领取进度与定位计时
+起点；发放记录（触发秒数/修订号/领取秒数）原样复制；跳过记录复制时
+``locate_seq`` 置 NULL（来源的定位操作不随副本转移，复制前的跳过在副本
+中不属于任何定位操作，之后撤销副本自己的定位也不会误恢复它们）；批注
+按原 ``seq`` 复制文字、累计秒数、登记时的位置/tick 与修订号，但每条
+生成**新的批注 ID**；``locate_operations`` 不复制（副本没有可撤销的
+定位操作，来源的操作 ID 对副本无效）。整个读-写与领取/定位/撤销/批注/
+发布共用进程内写锁与 SQLite 写锁串行化，故副本取自**一次完整的已提交
+状态**，不会拼接并行操作前后的数据；源排练不存在则抛
+:class:`RehearsalNotFound`（-> 404）并回滚，不留下半份副本。复制后
+两份排练完全独立，各自的领取/定位/批注/撤销只改写自己的行；来源撤销
+自己的定位不影响副本。
 """
 
 from __future__ import annotations
@@ -954,6 +969,144 @@ class Store:
             "restored": restored_indices,
             "rehearsal": rehearsal,
         }
+
+    # ------------------------------------------------------------------ #
+    # 续练副本：从现有排练的当前已提交状态整体复制出一份独立排练
+    # ------------------------------------------------------------------ #
+    def copy_rehearsal(self, rehearsal_id: str) -> dict:
+        """单事务复制排练：从同一已提交快照建立一份独立续练副本。
+
+        在 ``BEGIN IMMEDIATE`` 事务内读出源排练的主行、全部提示、发放与
+        跳过记录及批注，并整体写入新排练 ID 下的对应行：
+
+        * 主行：沿用同一谱例，继承读取瞬间的领取进度
+          （``last_elapsed``）与定位计时起点（``origin_ticks`` /
+          ``origin_elapsed``）；
+        * 提示与发放记录（触发秒数/修订号/领取秒数）原样复制；
+        * 跳过记录复制时 ``locate_seq`` 置 NULL：来源的定位操作不随
+          副本转移，复制前的跳过在副本中不属于任何定位操作——既无法
+          凭来源的操作 ID 撤销，之后撤销副本自己的定位（按
+          ``locate_seq`` 精确匹配）也不会误恢复它们（与旧库迁移留下
+          的 NULL 跳过记录同样处理）；
+        * 批注按原 ``seq`` 顺序复制文字、累计秒数、登记时的位置/tick
+          与修订号，但每条生成**新的批注 ID**；
+        * ``locate_operations`` 不复制：副本没有可撤销的定位操作
+          （``undoable_operation_id`` 为 null），来源的操作 ID 对副本
+          的撤销接口而言是 ``not_found``。
+
+        整个读-写在同一写事务内完成，与领取/定位/撤销/批注/发布共用
+        进程内写锁与 SQLite 写锁串行化：副本取自**一次完整的已提交
+        状态**，不会拼接并行操作前后的数据。源排练不存在 ->
+        :class:`RehearsalNotFound`（-> 404），事务回滚，不留下半份
+        副本。复制后两份排练完全独立：各自的领取/定位/批注/撤销只
+        改写自己的行；来源撤销自己的定位不影响副本。
+        """
+        copy_id = new_id()
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+            cue_rows = conn.execute(
+                "SELECT * FROM rehearsal_cues WHERE rehearsal_id = ? "
+                "ORDER BY cue_index",
+                (rehearsal_id,),
+            ).fetchall()
+            delivery_rows = conn.execute(
+                "SELECT * FROM cue_deliveries WHERE rehearsal_id = ?",
+                (rehearsal_id,),
+            ).fetchall()
+            skip_rows = conn.execute(
+                "SELECT * FROM cue_skips WHERE rehearsal_id = ?",
+                (rehearsal_id,),
+            ).fetchall()
+            annotation_rows = conn.execute(
+                "SELECT * FROM rehearsal_annotations WHERE rehearsal_id = ? "
+                "ORDER BY seq",
+                (rehearsal_id,),
+            ).fetchall()
+
+            conn.execute(
+                "INSERT INTO rehearsals "
+                "(id, score_id, last_elapsed, origin_ticks, origin_elapsed) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    copy_id,
+                    row["score_id"],
+                    row["last_elapsed"],
+                    row["origin_ticks"],
+                    row["origin_elapsed"],
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO rehearsal_cues "
+                "(rehearsal_id, cue_index, position, text, total_ticks) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        copy_id,
+                        c["cue_index"],
+                        c["position"],
+                        c["text"],
+                        c["total_ticks"],
+                    )
+                    for c in cue_rows
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO cue_deliveries "
+                "(rehearsal_id, cue_index, trigger_seconds, revision, "
+                " elapsed_seconds) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        copy_id,
+                        d["cue_index"],
+                        d["trigger_seconds"],
+                        d["revision"],
+                        d["elapsed_seconds"],
+                    )
+                    for d in delivery_rows
+                ],
+            )
+            # 复制前的跳过来路不可考（定位操作不转移）：locate_seq 置 NULL。
+            conn.executemany(
+                "INSERT INTO cue_skips "
+                "(rehearsal_id, cue_index, revision, elapsed_seconds, "
+                " locate_seq) VALUES (?, ?, ?, ?, NULL)",
+                [
+                    (
+                        copy_id,
+                        s["cue_index"],
+                        s["revision"],
+                        s["elapsed_seconds"],
+                    )
+                    for s in skip_rows
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO rehearsal_annotations "
+                "(rehearsal_id, seq, annotation_id, text, elapsed_seconds, "
+                " position, total_ticks, revision) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        copy_id,
+                        a["seq"],
+                        new_id(),  # 批注内容保留，ID 重新生成
+                        a["text"],
+                        a["elapsed_seconds"],
+                        a["position"],
+                        a["total_ticks"],
+                        a["revision"],
+                    )
+                    for a in annotation_rows
+                ],
+            )
+            conn.commit()
+        return self.get_rehearsal(copy_id)
 
     # ------------------------------------------------------------------ #
     # 排练批注：按当前领取进度登记文字批注并反推乐谱位置（登记时冻结）

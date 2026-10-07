@@ -43,8 +43,15 @@ app = FastAPI(
         "该次定位保存的原计时起点与当次跳过的待发提示；操作已撤销/过期"
         "（连续定位只能撤销最后一次）或定位后进度前进、提示发放、登记"
         "批注、速度图发布时返回 409 且状态不变。"
+        "排练需要分成两路继续时，可凭 POST /rehearsals/{id}/copies 从现有"
+        "排练的当前已提交状态创建一份独立续练副本（返回新排练 ID）：副本"
+        "沿用同一谱例，继承创建瞬间的领取进度、定位计时起点、全部提示及"
+        "已发/跳过记录；批注保留文字、累计秒数、登记时的位置与修订号但"
+        "使用新的批注 ID；来源的定位操作 ID 不转移（副本不能撤销复制前"
+        "的跳过），来源仍可撤销自己的定位且不影响副本；此后两份排练各自"
+        "领取、定位、登记批注与撤销，互不改写。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -274,6 +281,7 @@ async def root() -> dict:
         "convert": "/convert",
         "scores": "/scores",
         "rehearsals": "/rehearsals",
+        "copies": "/rehearsals/{rehearsal_id}/copies",
         "annotations": "/rehearsals/{rehearsal_id}/annotations",
         "undo_locate": "/rehearsals/{rehearsal_id}/locate/{operation_id}/undo",
     }
@@ -1301,6 +1309,39 @@ async def get_rehearsal(rehearsal_id: str):
     """查询排练：提示列表、发放/跳过状态（触发秒数/所用修订）与计时起点。"""
     try:
         rehearsal = store.get_rehearsal(rehearsal_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    try:
+        score = store.get_score(rehearsal["score_id"])
+    except ScoreNotFound:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(rehearsal["score_id"])
+    return _rehearsal_out(score, rehearsal)
+
+
+# ---------------------------------------------------------------------- #
+# 续练副本：从现有排练的当前已提交状态整体复制出一份独立排练
+# ---------------------------------------------------------------------- #
+@app.post(
+    "/rehearsals/{rehearsal_id}/copies",
+    response_model=RehearsalOut,
+    status_code=201,
+)
+async def copy_rehearsal(rehearsal_id: str):
+    """创建续练副本：把现有排练的当前状态整体复制为一份独立排练。
+
+    请求体为空。副本沿用同一谱例，继承创建瞬间的领取进度、定位计时
+    起点、全部提示及已发/跳过记录；批注保留文字、累计秒数、登记时的
+    位置与修订号，但使用新的批注 ID。复制在单个写事务内完成（与领取/
+    定位/撤销/发布串行化），取自一次完整的已提交状态，不拼接并行操作
+    前后的数据。来源的定位操作 ID 不转移：副本没有可撤销的定位
+    （复制前的跳过不属于任何定位操作，也不可被副本后续的撤销恢复）；
+    来源仍可撤销自己的定位，且不影响副本。此后两份排练各自领取、
+    定位、登记批注与撤销，互不改写进度与历史；共享谱例发布新速度图
+    时，两边待发提示各按新图计时，已发记录与批注保持原样。来源不
+    存在返回 404，不留下半份副本。
+    """
+    try:
+        rehearsal = store.copy_rehearsal(rehearsal_id)
     except RehearsalNotFound:
         return _rehearsal_not_found(rehearsal_id)
     try:

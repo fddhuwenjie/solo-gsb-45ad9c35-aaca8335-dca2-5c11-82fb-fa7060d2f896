@@ -40,6 +40,17 @@ SQLite，重启后可继续领取。
 不变**；撤销成功后待发提示按恢复的起点与当前速度图定时，查询与重启后
 的状态一致。
 
+排练需要**分成两路继续**时，可从现有排练的当前状态创建一份**独立续练
+副本**（`POST /rehearsals/{id}/copies`，返回新排练 ID）：副本沿用同一
+谱例，继承创建瞬间的领取进度、定位计时起点、全部提示及已发/跳过记录；
+既有批注的文字、累计秒数、登记时的位置与修订号保留，但使用**新的批注
+ID**。复制在**单个写事务**内取自一次完整的已提交状态（不拼接并行领取/
+定位/撤销/发布前后的数据）；来源的定位操作 ID **不转移**（副本不能撤销
+复制前的跳过），来源仍可撤销自己的定位且不影响副本；此后两份排练分别
+领取、定位、登记批注与撤销，互不改写；共享谱例发布新速度图时，两边
+待发提示各按新图计时，已发记录与批注保持原样。来源不存在返回 **404**，
+不留下半份副本。
+
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
 - 线性速度段按解析积分换算，反向换算在**同一速度段内解析求逆**；
@@ -58,6 +69,7 @@ SQLite，重启后可继续领取。
 - [录音锚点修订：创建 / 预览 / 发布](#录音锚点修订创建--预览--发布)
 - [排练提示：创建排练 / 领取到点提示 / 定位跳转 / 撤销定位](#排练提示创建排练--领取到点提示)
 - [排练批注：在当前进度登记 / 按登记先后查询](#排练批注在当前进度登记--按登记先后查询)
+- [排练副本：从当前状态创建独立续练副本](#排练副本从当前状态创建独立续练副本)
 - [约定与规则](#约定与规则)
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
@@ -89,6 +101,7 @@ docker compose up --build
 - 领取到点提示：`POST http://localhost:8000/rehearsals/{id}/claims`
 - 定位（跳转）：`POST http://localhost:8000/rehearsals/{id}/locate`
 - 撤销最近一次定位：`POST http://localhost:8000/rehearsals/{id}/locate/{operation_id}/undo`
+- 创建续练副本：`POST http://localhost:8000/rehearsals/{id}/copies`
 - 登记批注：`POST http://localhost:8000/rehearsals/{id}/annotations`
 - 查询批注：`GET  http://localhost:8000/rehearsals/{id}/annotations`
 - 查询排练：`GET  http://localhost:8000/rehearsals/{id}`
@@ -944,6 +957,189 @@ curl -s http://localhost:8000/rehearsals/$ARID2/annotations
 
 ---
 
+## 排练副本：从当前状态创建独立续练副本
+
+适用于“排练需要**分成两路继续**”的场景：从现有排练的**当前已提交
+状态**创建一份独立续练副本（返回新排练 ID），此后两份排练各自领取、
+定位、登记批注与撤销，互不改写进度与历史。
+
+### 规则
+
+1. **创建副本** `POST /rehearsals/{id}/copies`：请求体为空。返回
+   **201** 与新排练的完整状态（响应结构与创建排练一致），`id` 即
+   **新排练 ID**。副本**沿用同一谱例**，继承创建瞬间的：
+   - 领取进度 `last_elapsed_seconds`；
+   - 定位计时起点 `origin`（位置 / tick / 累计秒数）；
+   - 全部提示及其**已发**记录（触发秒数、所用修订号原样保留）与
+     **跳过**记录。
+2. **批注**：既有批注的文字、累计秒数、登记时的位置 / tick 与修订号
+   全部保留，但每条使用**新的批注 ID**；副本之后登记的批注接续编号，
+   与来源互不影响。
+3. **定位操作不转移**：来源的定位操作 ID 不复制——副本创建时
+   `undoable_operation_id` 为 `null`；把来源的操作 ID 提交给副本的
+   撤销接口返回 **409**（`reason: "not_found"`）；复制前的跳过在副本
+   中不属于任何定位操作，**副本不能撤销复制前的跳过**（之后撤销副本
+   自己的定位也只恢复它自己跳过的提示）。**来源仍可撤销自己的定位**，
+   撤销只改来源，不影响副本。
+4. **一致性**：复制在**单个写事务**内完成（与领取/定位/撤销/批注/
+   发布共用写锁串行化），副本取自**一次完整的已提交状态**，不会拼接
+   并行操作前后的数据；来源不存在返回 **404**，事务回滚，**不留下
+   半份副本**。
+5. **独立性**：此后两份排练各自领取、定位、登记批注与撤销，均只改写
+   自己的进度与历史；共享谱例后续发布速度图时，两边**待发提示各按
+   新图重新计时**（各自的定位起点不变），**已发记录与批注保持原样**。
+
+### HTTP 调用示例
+
+以下示例自包含（新建谱例与排练），120 BPM、4/4、PPQ=480：一拍
+0.5 s、一小节 2.0 s。
+
+#### 1）建立来源排练：领取一条提示、登记批注、定位到 4:1:0
+
+```bash
+CSID=$(curl -s -X POST http://localhost:8000/scores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ppq": 480,
+    "time_signatures": [],
+    "tempo_points": [{"position": "1:1:0", "bpm": 120, "curve": "step"}],
+    "anchors": [{"position": "1:1:0", "locked": true}]
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+CRID=$(curl -s -X POST http://localhost:8000/rehearsals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "score_id": "'$CSID'",
+    "cues": [
+      {"position": "2:1:0", "text": "进副歌"},
+      {"position": "3:1:0", "text": "渐慢准备"},
+      {"position": "5:1:0", "text": "收尾"}
+    ]
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+echo "谱例 ID：$CSID，来源排练 ID：$CRID"
+
+# 领取到 2.0s（“进副歌”到点已发），在当前进度登记一条批注
+curl -s -X POST http://localhost:8000/rehearsals/$CRID/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 2.0}' > /dev/null
+curl -s -X POST http://localhost:8000/rehearsals/$CRID/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "text": "进副歌时铜管稍慢"}' > /dev/null
+
+# 定位到 4:1:0：“渐慢准备”被跳过，计时起点变为 4:1:0 / 2.0s
+COP=$(curl -s -X POST http://localhost:8000/rehearsals/$CRID/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "position": "4:1:0"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["operation_id"])')
+echo "定位操作 ID：$COP"
+```
+
+#### 2）创建副本：返回新排练 ID，继承进度 / 起点 / 提示状态
+
+```bash
+CRID2=$(curl -s -X POST http://localhost:8000/rehearsals/$CRID/copies \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+echo "副本排练 ID：$CRID2"
+curl -s http://localhost:8000/rehearsals/$CRID2
+```
+
+副本继承创建瞬间的领取进度（2.0 s）、定位起点（`4:1:0` / 2.0 s）与
+全部提示状态（已发 / 跳过 / 待发）；`undoable_operation_id` 为 `null`
+（来源的定位操作不转移）：
+
+```json
+{
+  "id": "<新排练 ID>",
+  "score_id": "<谱例 ID>",
+  "last_elapsed_seconds": 2.0,
+  "origin": {"position": "4:1:0", "total_ticks": 5760,
+             "elapsed_seconds": 2.0},
+  "undoable_operation_id": null,
+  "cues": [
+    {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
+     "status": "delivered", "delivered": true,
+     "trigger_seconds": 2.0, "revision": 0, "skipped_revision": null},
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
+     "status": "skipped", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": 0},
+    {"index": 2, "position": "5:1:0", "text": "收尾", "total_ticks": 7680,
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null}
+  ]
+}
+```
+
+#### 3）副本的批注：内容保留，批注 ID 换新
+
+```bash
+curl -s http://localhost:8000/rehearsals/$CRID2/annotations
+```
+
+```json
+[
+  {"id": "<新批注 ID，与来源的不同>",
+   "text": "进副歌时铜管稍慢", "elapsed_seconds": 2.0,
+   "position": "2:1:0", "measure": 2, "beat": 1, "tick": 0,
+   "total_ticks": 1920, "revision": 0}
+]
+```
+
+#### 4）来源撤销自己的定位：只改来源，不影响副本
+
+把来源的操作 ID 提交给**副本**的撤销接口返回 **409**
+（`reason: "not_found"`，操作 ID 不转移）；来源自己撤销则成功——
+起点恢复为 `1:1:0` / 0.0 s，“渐慢准备”恢复待发，而**副本保持
+复制时的状态**（起点仍是 `4:1:0`，“渐慢准备”仍是跳过）：
+
+```bash
+curl -i -X POST http://localhost:8000/rehearsals/$CRID2/locate/$COP/undo
+# HTTP/1.1 409 Conflict  {"detail": [{"reason": "not_found", ...}]}
+
+curl -s -X POST http://localhost:8000/rehearsals/$CRID/locate/$COP/undo
+# -> origin 恢复为 1:1:0 / 0.0s，restored 含“渐慢准备”
+
+curl -s http://localhost:8000/rehearsals/$CRID2
+# -> 副本不变：origin 仍是 4:1:0 / 2.0s，“渐慢准备”仍 skipped
+```
+
+#### 5）发布新速度图后，两路分别续领：各按新图计时
+
+把整体速度放慢到 60 BPM（修订 0 → 1）。来源的起点已恢复为乐谱原点，
+“渐慢准备”按新图绝对 **8.0 s** 到点；副本的起点仍是 `4:1:0` / 2.0 s，
+“收尾”按新图 `2.0 + 4.0 = 6.0` s 到点——两份排练互不改写，已发记录
+（“进副歌” rev0 / 2.0 s）与批注（rev0 / `2:1:0`）保持原样：
+
+```bash
+curl -s -X POST http://localhost:8000/scores/$CSID/revisions/0/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]}' \
+  > /dev/null
+
+# 来源续领：渐慢准备按新图绝对 8.0s 到点（rev1）
+curl -s -X POST http://localhost:8000/rehearsals/$CRID/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 8.0}'
+# {"id": "...", "elapsed_seconds": 8.0, "revision": 1,
+#  "cues": [{"index": 1, "position": "3:1:0", "text": "渐慢准备",
+#            "trigger_seconds": 8.0, "revision": 1}]}
+
+# 副本续领：收尾按新图 2.0 + 4:1:0->5:1:0 的 4.0s = 6.0s 到点（rev1）
+curl -s -X POST http://localhost:8000/rehearsals/$CRID2/claims \
+  -H 'Content-Type: application/json' -d '{"elapsed_seconds": 6.0}'
+# {"id": "...", "elapsed_seconds": 6.0, "revision": 1,
+#  "cues": [{"index": 2, "position": "5:1:0", "text": "收尾",
+#            "trigger_seconds": 6.0, "revision": 1}]}
+```
+
+#### 6）来源不存在：404，不留下半份副本
+
+```bash
+curl -i -X POST http://localhost:8000/rehearsals/deadbeef/copies
+# HTTP/1.1 404 Not Found
+# {"detail": [{"loc": ["path", "rehearsal_id"],
+#   "msg": "排练 deadbeef 不存在", "index": null}]}
+```
+
+---
+
 ## 约定与规则
 
 ### 1. PPQ 与位置 `小节:拍:tick`
@@ -1234,7 +1430,8 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
 
 排练接口还可能返回：
 
-- **404**：谱例 ID（创建排练时）或排练 ID（领取/定位/查询时）不存在，
+- **404**：谱例 ID（创建排练时）或排练 ID（领取/定位/撤销/创建副本/
+  查询时）不存在，
   `detail[0].loc` 分别指向 `path.score_id` / `path.rehearsal_id`；
 - **409**：领取秒数早于已领取进度（倒退），状态不变：
 
@@ -1343,6 +1540,16 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 与位置自洽且 seq 连续（进度/起点/速度图取自同一已提交状态）**，以及
 Store 重启（模拟 Compose 重启）后批注保留、可继续登记且 seq 接续。
 
+副本测试（`tests/test_copies.py`）覆盖：副本沿用同一谱例并继承领取
+进度/定位起点/全部提示及已发跳过记录（含未推进排练的复制）、批注内容
+保留但换新批注 ID 且副本后续批注接续编号、定位操作 ID 不转移（副本
+`undoable_operation_id` 为 null、来源操作 ID 对副本 **409**、复制前的
+跳过不被副本自己的撤销恢复）、来源撤销自己的定位不影响副本、复制后
+两路独立领取/定位/批注/撤销、**发布后两边待发提示各按新图计时而已发
+记录与批注冻结**、来源不存在 **404** 且不留半份副本、**多连接复制与
+领取并发时每个副本都取自一次完整的已提交状态（进度与发放记录不自相
+矛盾）**，以及 Store 重启后副本状态保留、可继续领取。
+
 ## 项目结构
 
 ```
@@ -1353,7 +1560,7 @@ Store 重启（模拟 Compose 重启）后批注保留、可继续登记且 seq 
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
 │   └── db.py          # SQLite 持久化：谱例/锚点/修订号乐观锁原子发布，
 │                      #   排练/提示/发放/跳过/定位操作/批注，单事务领取、
-│                      #   定位与撤销定位
+│                      #   定位、撤销定位与续练副本复制
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
@@ -1362,7 +1569,9 @@ Store 重启（模拟 Compose 重启）后批注保留、可继续登记且 seq 
 │   ├── test_rehearsals.py # 排练创建/领取/定位跳过/并发与持久化测试
 │   ├── test_undo_locate.py # 撤销定位：恢复起点/待发提示、409 过期规则、
 │                      #   连续定位、并发与持久化、旧库迁移测试
-│   └── test_annotations.py # 批注登记/位置反推/冻结/并发与持久化测试
+│   ├── test_annotations.py # 批注登记/位置反推/冻结/并发与持久化测试
+│   └── test_copies.py   # 续练副本：继承状态/新批注 ID/操作不转移、
+│                      #   两路独立续练、并发快照与持久化测试
 ├── Dockerfile
 ├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）
 ├── requirements.txt
