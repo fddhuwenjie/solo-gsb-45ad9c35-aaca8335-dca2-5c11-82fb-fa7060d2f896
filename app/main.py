@@ -43,8 +43,13 @@ app = FastAPI(
         "该次定位保存的原计时起点与当次跳过的待发提示；操作已撤销/过期"
         "（连续定位只能撤销最后一次）或定位后进度前进、提示发放、登记"
         "批注、速度图发布时返回 409 且状态不变。"
+        "还可从现有排练的当前已提交状态创建独立续练副本：新排练 ID 沿用"
+        "同一谱例，继承创建瞬间的领取进度、定位计时起点、全部提示及已发/"
+        "跳过记录与批注（批注用新 ID；定位操作 ID 不转移，副本不能撤销"
+        "复制前的跳过），此后两份排练各自领取、定位、登记批注与撤销，"
+        "互不改写。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -276,6 +281,7 @@ async def root() -> dict:
         "rehearsals": "/rehearsals",
         "annotations": "/rehearsals/{rehearsal_id}/annotations",
         "undo_locate": "/rehearsals/{rehearsal_id}/locate/{operation_id}/undo",
+        "copies": "/rehearsals/{rehearsal_id}/copies",
     }
 
 
@@ -1307,6 +1313,43 @@ async def get_rehearsal(rehearsal_id: str):
         score = store.get_score(rehearsal["score_id"])
     except ScoreNotFound:  # 防御性：谱例被删（正常不会发生）
         return _not_found(rehearsal["score_id"])
+    return _rehearsal_out(score, rehearsal)
+
+
+# ---------------------------------------------------------------------- #
+# 排练副本：从当前已提交状态创建独立续练副本（新排练 ID）
+# ---------------------------------------------------------------------- #
+@app.post(
+    "/rehearsals/{rehearsal_id}/copies",
+    response_model=RehearsalOut,
+    status_code=201,
+)
+async def copy_rehearsal(rehearsal_id: str):
+    """从现有排练的当前状态创建一份独立续练副本，返回新排练 ID。
+
+    副本沿用同一谱例，在单个写事务内取自一次完整的已提交状态（不拼接
+    并行领取、定位、撤销或发布前后的数据），继承创建瞬间的：
+
+    * 领取进度 ``last_elapsed_seconds`` 与定位计时起点 ``origin``；
+    * 全部提示及其已发/跳过记录（触发秒数、所用修订号原样保留）；
+    * 全部批注：文字、累计秒数、登记时的位置与修订号保留，但使用
+      **新的批注 ID**。
+
+    来源排练的定位操作 ID **不转移**：副本不能撤销复制前的跳过
+    （``undoable_operation_id`` 为 null）；来源仍可撤销自己的定位，
+    且不改变副本。复制后两份排练分别领取、定位、登记批注和撤销，互不
+    改写进度与历史；共享谱例后续发布速度图时，两边待发提示各按新图
+    计时，已发记录与批注保持原样。来源排练不存在返回 **404**，不留下
+    半份副本。
+    """
+    try:
+        rehearsal = store.copy_rehearsal(rehearsal_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    try:
+        score = store.get_score(rehearsal["score_id"])
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
     return _rehearsal_out(score, rehearsal)
 
 

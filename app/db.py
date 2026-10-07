@@ -32,6 +32,20 @@
   速度图反推并量化的乐谱位置/tick 与所用修订号——全部冻结，速度图
   发布或再次定位后保持登记时的值）。
 
+排练副本（``copy_rehearsal``）也是单事务：在 ``BEGIN IMMEDIATE`` 同一
+快照内把来源排练的主行（领取进度、定位计时起点）、全部提示、已发与
+跳过记录、批注整体复制到**新排练 ID** 下——与领取/定位/撤销/发布共用
+进程内写锁串行化，故副本必然取自**一次完整的已提交状态**，不会拼接
+并行操作前后的数据。``locate_operations`` **不复制**（来源的定位操作
+ID 不转移，副本无从撤销复制前的定位），复制来的跳过记录
+``locate_seq`` 置 ``NULL``（与旧库迁移语义一致：不属于任何可撤销
+操作，副本此后自己的定位撤销也不会误删它们）；批注复制时保留文字、
+累计秒数、登记时的位置/tick/修订号与登记顺序，但逐条生成**新的批注
+ID**。复制提交后两份排练完全独立：各自领取、定位、登记批注、撤销
+互不改写；共享谱例后续发布速度图时，两边待发提示各按新图计时，已发
+记录与批注保持原样。来源不存在 -> :class:`RehearsalNotFound`
+（-> 404），事务回滚，不留下半份副本。
+
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
 修订号，锁定锚点秒数不变。进程内再用一把锁串行化写事务。
@@ -954,6 +968,115 @@ class Store:
             "restored": restored_indices,
             "rehearsal": rehearsal,
         }
+
+    # ------------------------------------------------------------------ #
+    # 排练副本：从当前已提交状态复制一份独立续练排练（新排练 ID）
+    # ------------------------------------------------------------------ #
+    def copy_rehearsal(self, rehearsal_id: str) -> dict:
+        """单事务复制排练：从来源排练当前已提交状态创建独立续练副本。
+
+        在 ``BEGIN IMMEDIATE`` 同一事务快照内整体复制（与领取/定位/撤销/
+        发布共用进程内写锁串行化，故读到的是**一次完整的已提交状态**，不会
+        拼接并行操作前后的数据）：
+
+        * 主行：新排练 ID、同一谱例，继承创建瞬间的领取进度
+          ``last_elapsed`` 与定位计时起点 ``origin_ticks`` /
+          ``origin_elapsed``；
+        * 提示：全部 ``rehearsal_cues`` 原样复制（编号、位置、文字、tick
+          坐标不变）；
+        * 已发记录 ``cue_deliveries``：触发秒数、所用修订号、领取时累计
+          秒数原样保留（已发提示在副本中不撤回、不重发）；
+        * 跳过记录 ``cue_skips``：跳过时的修订号与提交秒数保留，
+          ``locate_seq`` 置 ``NULL``——``locate_operations`` **不复制**
+          （来源的定位操作 ID 不转移），副本不能撤销复制前的跳过；此后
+          副本自己的定位从序号 0 开始，撤销也只匹配本次序号，不会误删
+          这些 ``NULL`` 记录（与旧库迁移语义一致）；
+        * 批注 ``rehearsal_annotations``：文字、累计秒数、登记时的位置/
+          tick/修订号与登记顺序（``seq``）保留，逐条生成**新的批注 ID**。
+
+        复制提交后两份排练完全独立：各自领取、定位、登记批注、撤销互不
+        改写对方进度与历史；来源仍可撤销自己的定位（只动来源自己的行），
+        不影响副本。共享谱例后续发布速度图时，两边待发提示各按新图计时，
+        已发记录与批注保持原样（既有领取/批注逻辑的自然结果）。
+
+        来源不存在 -> :class:`RehearsalNotFound`（-> 404），事务回滚，
+        不留下半份副本。
+        """
+        new_rehearsal_id = new_id()
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+
+            conn.execute(
+                "INSERT INTO rehearsals "
+                "(id, score_id, last_elapsed, origin_ticks, origin_elapsed) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    new_rehearsal_id,
+                    row["score_id"],
+                    row["last_elapsed"],
+                    row["origin_ticks"],
+                    row["origin_elapsed"],
+                ),
+            )
+            conn.execute(
+                "INSERT INTO rehearsal_cues "
+                "(rehearsal_id, cue_index, position, text, total_ticks) "
+                "SELECT ?, cue_index, position, text, total_ticks "
+                "FROM rehearsal_cues WHERE rehearsal_id = ?",
+                (new_rehearsal_id, rehearsal_id),
+            )
+            conn.execute(
+                "INSERT INTO cue_deliveries "
+                "(rehearsal_id, cue_index, trigger_seconds, revision, "
+                " elapsed_seconds) "
+                "SELECT ?, cue_index, trigger_seconds, revision, "
+                "       elapsed_seconds "
+                "FROM cue_deliveries WHERE rehearsal_id = ?",
+                (new_rehearsal_id, rehearsal_id),
+            )
+            conn.execute(
+                "INSERT INTO cue_skips "
+                "(rehearsal_id, cue_index, revision, elapsed_seconds, "
+                " locate_seq) "
+                "SELECT ?, cue_index, revision, elapsed_seconds, NULL "
+                "FROM cue_skips WHERE rehearsal_id = ?",
+                (new_rehearsal_id, rehearsal_id),
+            )
+            # 批注逐条复制：内容与登记顺序保留，批注 ID 重新生成。
+            annotation_rows = conn.execute(
+                "SELECT seq, text, elapsed_seconds, position, total_ticks, "
+                "       revision "
+                "FROM rehearsal_annotations WHERE rehearsal_id = ? "
+                "ORDER BY seq",
+                (rehearsal_id,),
+            ).fetchall()
+            conn.executemany(
+                "INSERT INTO rehearsal_annotations "
+                "(rehearsal_id, seq, annotation_id, text, elapsed_seconds, "
+                " position, total_ticks, revision) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        new_rehearsal_id,
+                        a["seq"],
+                        new_id(),
+                        a["text"],
+                        a["elapsed_seconds"],
+                        a["position"],
+                        a["total_ticks"],
+                        a["revision"],
+                    )
+                    for a in annotation_rows
+                ],
+            )
+            conn.commit()
+        return self.get_rehearsal(new_rehearsal_id)
 
     # ------------------------------------------------------------------ #
     # 排练批注：按当前领取进度登记文字批注并反推乐谱位置（登记时冻结）
